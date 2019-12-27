@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"os"
 )
 
 const defaultConcurrency = 8
@@ -22,6 +23,7 @@ const (
 	errExpiringShortly = "%s: ** '%s' (S/N %X) expires in %d hours! **"
 	errExpiringSoon    = "%s: '%s' (S/N %X) expires in roughly %d days."
 	errSunsetAlg       = "%s: '%s' (S/N %X) expires after the sunset date for its signature algorithm '%s'."
+	sslPort            = "443"
 )
 
 type sigAlgSunset struct {
@@ -60,6 +62,7 @@ var sunsetSigAlgs = map[x509.SignatureAlgorithm]sigAlgSunset{
 
 var (
 	hostsFile   = flag.String("hosts", "", "The path to the file containing a list of hosts to check.")
+	hostsPipe   = flag.Bool("stdin", false, "Use stdin. False by default. If no hostsFile this is set to true, otherwise this is always false")
 	warnYears   = flag.Int("years", 0, "Warn if the certificate will expire within this many years.")
 	warnMonths  = flag.Int("months", 0, "Warn if the certificate will expire within this many months.")
 	warnDays    = flag.Int("days", 0, "Warn if the certificate will expire within this many days.")
@@ -82,9 +85,9 @@ func main() {
 	flag.Parse()
 
 	if len(*hostsFile) == 0 {
-		flag.Usage()
-		return
+		*hostsPipe = true
 	}
+
 	if *warnYears < 0 {
 		*warnYears = 0
 	}
@@ -101,10 +104,11 @@ func main() {
 		*concurrency = defaultConcurrency
 	}
 
-	processHosts()
+	// Process all the hosts and exist with the total of errors
+	os.Exit(processHosts())
 }
 
-func processHosts() {
+func processHosts() int{
 	done := make(chan struct{})
 	defer close(done)
 
@@ -124,17 +128,21 @@ func processHosts() {
 		close(results)
 	}()
 
+	errors := 0
 	for r := range results {
 		if r.err != nil {
 			log.Printf("%s: %v\n", r.host, r.err)
+			errors++
 			continue
 		}
 		for _, cert := range r.certs {
 			for _, err := range cert.errs {
 				log.Println(err)
+				errors++
 			}
 		}
 	}
+	return errors
 }
 
 func queueHosts(done <-chan struct{}) <-chan string {
@@ -142,11 +150,21 @@ func queueHosts(done <-chan struct{}) <-chan string {
 	go func() {
 		defer close(hosts)
 
-		fileContents, err := ioutil.ReadFile(*hostsFile)
+		var err error
+		var fileContents []byte
+
+		if(*hostsPipe){
+			fileContents, err = ioutil.ReadAll(os.Stdin)
+		}else{
+			fileContents, err = ioutil.ReadFile(*hostsFile)
+		}
+
 		if err != nil {
 			return
 		}
+
 		lines := strings.Split(string(fileContents), "\n")
+
 		for _, line := range lines {
 			host := strings.TrimSpace(line)
 			if len(host) == 0 || host[0] == '#' {
@@ -165,19 +183,19 @@ func queueHosts(done <-chan struct{}) <-chan string {
 func processQueue(done <-chan struct{}, hosts <-chan string, results chan<- hostResult) {
 	for host := range hosts {
 		select {
-		case results <- checkHost(host):
+		case results <- checkHost(host, sslPort):
 		case <-done:
 			return
 		}
 	}
 }
 
-func checkHost(host string) (result hostResult) {
+func checkHost(host, port string) (result hostResult) {
 	result = hostResult{
 		host:  host,
 		certs: []certErrors{},
 	}
-	conn, err := tls.Dial("tcp", host, nil)
+	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:%s", host, sslPort), nil)
 	if err != nil {
 		result.err = err
 		return
